@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Optional, Dict, Tuple, Any, List
 from fastapi import HTTPException, status
 import litellm
@@ -8,6 +9,7 @@ from litellm.exceptions import (
     BadGatewayError,
     ServiceUnavailableError,
     APIConnectionError,
+    Timeout,
     APIError,
 )
 
@@ -21,10 +23,27 @@ class FailoverService:
     Manages key pool iteration, failure simulation (X-Simulate-Failure),
     and automatic failover across multiple API keys.
     """
-    SUPPORTED_STATUSES = {429, 500, 502, 503}
+    SUPPORTED_STATUSES = {429, 500, 502, 503, 504}
 
     def __init__(self):
         pass
+
+    def sanitize_error(self, error: Any, keys: Optional[List[str]] = None) -> str:
+        """
+        Redacts API keys and secrets from exception strings or payloads.
+        """
+        if error is None:
+            return ""
+        msg = str(error)
+        if keys:
+            for k in keys:
+                if k and len(k) > 4:
+                    msg = msg.replace(k, "[REDACTED_API_KEY]")
+        msg = re.sub(r'AIza[0-9A-Za-z-_]{35}', '[REDACTED_API_KEY]', msg)
+        msg = re.sub(r'AQ\.[0-9A-Za-z-_]+', '[REDACTED_API_KEY]', msg)
+        msg = re.sub(r'key=[0-9A-Za-z-_]+', 'key=[REDACTED_API_KEY]', msg)
+        msg = re.sub(r'x-goog-api-key["\']?\s*:\s*["\']?[0-9A-Za-z-_]+', 'x-goog-api-key: [REDACTED_API_KEY]', msg)
+        return msg
 
     def parse_simulation_header(self, header_value: Optional[str]) -> Dict[str, int]:
         """
@@ -55,7 +74,7 @@ class FailoverService:
     def is_failover_error(self, error: Exception) -> bool:
         """
         Determines if an exception qualifies for automatic failover
-        (HTTP 429, quota exhaustion, or 5xx server errors).
+        (HTTP 429, 500, 502, 503, 504, quota exhaustion, or temporary server errors).
         """
         status_code = getattr(error, "status_code", None)
         if status_code in self.SUPPORTED_STATUSES:
@@ -67,15 +86,18 @@ class FailoverService:
             BadGatewayError,
             ServiceUnavailableError,
             APIConnectionError,
+            Timeout,
         )):
             return True
 
         err_str = str(error).lower()
         failover_keywords = [
-            "429", "500", "502", "503",
+            "429", "500", "502", "503", "504",
             "quota", "rate limit", "rate_limit",
-            "resource has been exhausted", "overloaded",
-            "service unavailable", "bad gateway"
+            "resource has been exhausted", "resource_exhausted", "overloaded",
+            "service unavailable", "bad gateway", "gateway timeout",
+            "timed out", "timeout", "temporarily unavailable",
+            "connection error", "connection reset"
         ]
         return any(keyword in err_str for keyword in failover_keywords)
 
@@ -148,20 +170,33 @@ class FailoverService:
                     return response, None, 0
 
                 # Live inference succeeded
+                logger.info(f"Request resolved via {key_id} (fallback_attempts={fallback_attempts})")
                 return response, key_id, fallback_attempts
 
             except Exception as e:
+                status_code = getattr(e, "status_code", None)
+                sanitized_msg = self.sanitize_error(e, configured_keys)
                 if self.is_failover_error(e):
-                    logger.warning(f"Key {key_id} encountered retryable failover error: {type(e).__name__}")
+                    logger.warning(
+                        f"Key {key_id} encountered retryable failover error: "
+                        f"{type(e).__name__} (status={status_code}): {sanitized_msg}"
+                    )
                     fallback_attempts += 1
                     last_exception = e
                     continue
                 else:
-                    logger.error(f"Key {key_id} encountered non-failover error: {str(e)}")
+                    logger.error(
+                        f"Key {key_id} encountered non-failover error: "
+                        f"{type(e).__name__} (status={status_code}): {sanitized_msg}"
+                    )
                     raise
 
         # If every key in the pool failed or was simulated to fail
-        logger.error(f"All {len(key_entries)} providers failed after {fallback_attempts} fallback attempts.")
+        last_err_msg = self.sanitize_error(last_exception, configured_keys) if last_exception else "no prior exception"
+        logger.error(
+            f"All {len(key_entries)} providers failed after {fallback_attempts} fallback attempts. "
+            f"Last error: {last_err_msg}"
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="all providers unavailable"

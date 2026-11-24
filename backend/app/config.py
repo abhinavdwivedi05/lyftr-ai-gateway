@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     @property
     def key_pool(self) -> List[str]:
-        keys = [k.strip() for k in self.LLM_API_KEYS.split(",") if k.strip()]
+        keys = [k.strip().strip("'").strip('"') for k in self.LLM_API_KEYS.split(",") if k.strip().strip("'").strip('"')]
         return keys
 
     @property

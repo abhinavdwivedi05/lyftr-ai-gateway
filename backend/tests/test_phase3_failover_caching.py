@@ -266,3 +266,95 @@ def test_17_normal_cache_behavior_works_after_failure_simulation(client_with_db)
     assert meta3["resolution_source"] == "LLM_CACHE"
     assert meta3["key_id"] is None
     assert meta3["fallback_attempts"] == 0
+
+def test_18_key1_simulated_429_followed_by_successful_key2_inference(client_with_db):
+    resp = client_with_db.post(
+        "/chat",
+        json={"session_id": "s-det-429", "message": "Deterministic test 429 failover"},
+        headers={"X-Simulate-Failure": "key_1=429"}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["reply"]
+    meta = data["metadata"]
+    assert meta["resolution_source"] == "LIVE_INFERENCE"
+    assert meta["key_id"] == "key_2"
+    assert meta["fallback_attempts"] == 1
+
+def test_19_both_keys_failing_simulation_returns_503(client_with_db):
+    resp = client_with_db.post(
+        "/chat",
+        json={"session_id": "s-det-both-fail", "message": "Both keys failing"},
+        headers={"X-Simulate-Failure": "key_1=429,key_2=503"}
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "all providers unavailable"
+
+def test_20_key1_succeeding_without_fallback(client_with_db):
+    resp = client_with_db.post(
+        "/chat",
+        json={"session_id": "s-det-clean-1", "message": "Clean prompt without failover"}
+    )
+    assert resp.status_code == 200
+    meta = resp.json()["metadata"]
+    assert meta["resolution_source"] == "LIVE_INFERENCE"
+    assert meta["key_id"] == "key_1"
+    assert meta["fallback_attempts"] == 0
+
+def test_21_sanitize_error_redacts_api_keys_and_patterns():
+    from app.services.failover_service import failover_service
+    test_keys = ["AIzaSyD_my_secret_key_1234567890abc", "AQ.Ab8XYZ_another_secret_key"]
+    raw_error = (
+        "ServiceUnavailableError at https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-flash?key=AIzaSyD_my_secret_key_1234567890abc with header "
+        "x-goog-api-key: AQ.Ab8XYZ_another_secret_key and message Rate limit exceeded"
+    )
+    sanitized = failover_service.sanitize_error(raw_error, test_keys)
+    assert "AIzaSyD_my_secret_key_1234567890abc" not in sanitized
+    assert "AQ.Ab8XYZ_another_secret_key" not in sanitized
+    assert "[REDACTED_API_KEY]" in sanitized
+
+def test_22_real_exception_on_key1_falls_back_to_key2(client_with_db, monkeypatch):
+    import litellm
+    from litellm.exceptions import ServiceUnavailableError
+    from unittest.mock import MagicMock
+
+    real_completion = litellm.completion
+
+    def mock_completion(**kwargs):
+        api_key = kwargs.get("api_key")
+        # If key_1 is passed, raise real ServiceUnavailableError
+        if api_key == settings.key_pool[0]:
+            raise ServiceUnavailableError(
+                message="Google Gemini 503: The model is overloaded. Please try again later.",
+                llm_provider="gemini",
+                model=settings.LLM_MODEL,
+                response=MagicMock(status_code=503)
+            )
+        # key_2 succeeds
+        return real_completion(**kwargs)
+
+    monkeypatch.setattr(litellm, "completion", mock_completion)
+
+    resp = client_with_db.post(
+        "/chat",
+        json={"session_id": "s-real-exc-1", "message": "Test real provider 503 failover"}
+    )
+    assert resp.status_code == 200
+    meta = resp.json()["metadata"]
+    assert meta["resolution_source"] == "LIVE_INFERENCE"
+    assert meta["key_id"] == "key_2"
+    assert meta["fallback_attempts"] == 1
+
+def test_23_status_504_gateway_timeout_triggers_fallback(client_with_db):
+    resp = client_with_db.post(
+        "/chat",
+        json={"session_id": "s-sim-504", "message": "Trigger 504 failover"},
+        headers={"X-Simulate-Failure": "key_1=504"}
+    )
+    assert resp.status_code == 200
+    meta = resp.json()["metadata"]
+    assert meta["resolution_source"] == "LIVE_INFERENCE"
+    assert meta["key_id"] == "key_2"
+    assert meta["fallback_attempts"] == 1
+
